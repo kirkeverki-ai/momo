@@ -313,7 +313,7 @@ impl<T: Serialize> From<MomoError> for ApiResponse<T> {
             }
 
             MomoError::Database(ref msg) => {
-                let lower = msg.to_lowercase();
+                let lower = msg.to_string().to_lowercase();
                 if lower.contains("database is locked")
                     || lower.contains("database busy")
                     || lower.contains("busy timeout")
