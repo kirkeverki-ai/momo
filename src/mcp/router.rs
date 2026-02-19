@@ -90,20 +90,29 @@ fn discover_base_url(config: &Config, headers: &HeaderMap) -> String {
         return public_url.trim_end_matches('/').to_string();
     }
 
-    let forwarded_proto = headers
-        .get("x-forwarded-proto")
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_string)
-        .unwrap_or_else(|| "http".to_string());
+    if config.mcp.trust_forwarded_headers {
+        let forwarded_proto = headers
+            .get("x-forwarded-proto")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string)
+            .unwrap_or_else(|| "http".to_string());
 
-    let host = headers
-        .get("x-forwarded-host")
-        .or_else(|| headers.get("host"))
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_string)
-        .unwrap_or_else(|| format!("{}:{}", config.server.host, config.server.port));
+        let host = headers
+            .get("x-forwarded-host")
+            .or_else(|| headers.get("host"))
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("{}:{}", config.server.host, config.server.port));
 
-    format!("{forwarded_proto}://{host}")
+        return format!("{forwarded_proto}://{host}");
+    }
+
+    let host = match config.server.host.as_str() {
+        "0.0.0.0" | "::" => "localhost".to_string(),
+        other => other.to_string(),
+    };
+
+    format!("http://{}:{}", host, config.server.port)
 }
 
 #[cfg(test)]
@@ -122,7 +131,8 @@ mod tests {
 
     #[test]
     fn base_url_uses_forwarded_headers() {
-        let config = crate::config::Config::default();
+        let mut config = crate::config::Config::default();
+        config.mcp.trust_forwarded_headers = true;
 
         let mut headers = HeaderMap::new();
         headers.insert("x-forwarded-proto", "https".parse().unwrap());
@@ -130,5 +140,20 @@ mod tests {
 
         let base_url = discover_base_url(&config, &headers);
         assert_eq!(base_url, "https://memory.example.com");
+    }
+
+    #[test]
+    fn base_url_ignores_forwarded_headers_without_trust() {
+        let mut config = crate::config::Config::default();
+        config.server.host = "127.0.0.1".to_string();
+        config.server.port = 8080;
+        config.mcp.trust_forwarded_headers = false;
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-proto", "https".parse().unwrap());
+        headers.insert("x-forwarded-host", "memory.example.com".parse().unwrap());
+
+        let base_url = discover_base_url(&config, &headers);
+        assert_eq!(base_url, "http://127.0.0.1:8080");
     }
 }

@@ -1,4 +1,6 @@
 use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
+#[cfg(test)]
+use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex};
 
 use crate::config::{parse_provider_model, EmbeddingsConfig};
@@ -12,6 +14,8 @@ enum EmbeddingBackend {
         ingest_batch_size: usize,
         ingest_batch_pause_ms: u64,
     },
+    #[cfg(test)]
+    Mock,
 }
 
 pub struct EmbeddingProvider {
@@ -70,6 +74,15 @@ impl EmbeddingProvider {
         })
     }
 
+    /// Deterministic mock embeddings for tests and offline validation.
+    #[cfg(test)]
+    pub fn new_mock(dimensions: usize) -> Self {
+        Self {
+            backend: EmbeddingBackend::Mock,
+            dimensions: dimensions.max(1),
+        }
+    }
+
     pub async fn embed(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
         self.embed_with_mode(texts, EmbeddingMode::Query).await
     }
@@ -107,6 +120,11 @@ impl EmbeddingProvider {
                 .await
                 .map_err(|e| MomoError::Embedding(format!("Embedding worker failed: {e}")))?
             }
+            #[cfg(test)]
+            EmbeddingBackend::Mock => Ok(texts
+                .into_iter()
+                .map(|text| deterministic_embedding(&text, self.dimensions, mode))
+                .collect()),
         }
     }
 
@@ -125,6 +143,16 @@ impl EmbeddingProvider {
                 let prefixed = format!("query: {query}");
                 self.embed_single(&prefixed).await
             }
+            #[cfg(test)]
+            EmbeddingBackend::Mock => {
+                let embeddings = self
+                    .embed_with_mode(vec![query.to_string()], EmbeddingMode::Query)
+                    .await?;
+                embeddings
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| MomoError::Embedding("No embedding generated".to_string()))
+            }
         }
     }
 
@@ -134,6 +162,16 @@ impl EmbeddingProvider {
                 // Local models use passage: prefix
                 let prefixed = format!("passage: {passage}");
                 self.embed_single(&prefixed).await
+            }
+            #[cfg(test)]
+            EmbeddingBackend::Mock => {
+                let embeddings = self
+                    .embed_with_mode(vec![passage.to_string()], EmbeddingMode::Ingest)
+                    .await?;
+                embeddings
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| MomoError::Embedding("No embedding generated".to_string()))
             }
         }
     }
@@ -168,6 +206,8 @@ impl EmbeddingProvider {
 
                 Ok(all_embeddings)
             }
+            #[cfg(test)]
+            EmbeddingBackend::Mock => self.embed_with_mode(passages, EmbeddingMode::Ingest).await,
         }
     }
 
@@ -193,6 +233,11 @@ impl Clone for EmbeddingProvider {
                     ingest_batch_size: *ingest_batch_size,
                     ingest_batch_pause_ms: *ingest_batch_pause_ms,
                 },
+                dimensions: self.dimensions,
+            },
+            #[cfg(test)]
+            EmbeddingBackend::Mock => Self {
+                backend: EmbeddingBackend::Mock,
                 dimensions: self.dimensions,
             },
         }
@@ -253,4 +298,23 @@ fn parse_bool(raw: &str) -> Option<bool> {
         "0" | "false" | "no" | "off" => Some(false),
         _ => None,
     }
+}
+
+#[cfg(test)]
+fn deterministic_embedding(text: &str, dimensions: usize, mode: EmbeddingMode) -> Vec<f32> {
+    let mode_seed = match mode {
+        EmbeddingMode::Query => 0_u64,
+        EmbeddingMode::Ingest => 1_u64,
+    };
+
+    (0..dimensions)
+        .map(|index| {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            text.hash(&mut hasher);
+            index.hash(&mut hasher);
+            mode_seed.hash(&mut hasher);
+            let bucket = (hasher.finish() % 2001) as i32;
+            (bucket as f32 / 1000.0) - 1.0
+        })
+        .collect()
 }

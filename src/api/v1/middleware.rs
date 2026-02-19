@@ -24,8 +24,8 @@ use super::response::{ApiResponse, ErrorCode};
 ///
 /// # Behavior
 ///
-/// - If `MOMO_API_KEYS` is empty/unset → returns 401 with JSON error envelope.
-///   The server still starts, but protected routes are locked down.
+/// - If `MOMO_API_KEYS` is empty/unset and `MOMO_ALLOW_NO_AUTH=1` → auth is bypassed.
+/// - If `MOMO_API_KEYS` is empty/unset and `MOMO_ALLOW_NO_AUTH` is not enabled → 401.
 /// - If the `Authorization: Bearer <token>` header is missing or malformed → 401.
 /// - If the token is not in the configured key list → 401.
 /// - If the token is valid → passes the request through to the next handler.
@@ -42,6 +42,9 @@ pub async fn v1_auth_middleware(
     next: Next,
 ) -> Response {
     if state.config.server.api_keys.is_empty() {
+        if state.config.server.allow_no_auth {
+            return next.run(request).await;
+        }
         return ApiResponse::<()>::error(
             ErrorCode::Unauthorized,
             "API keys not configured. Set MOMO_API_KEYS to enable access.",
@@ -99,6 +102,23 @@ mod tests {
                 host: "127.0.0.1".to_string(),
                 port: 3000,
                 api_keys,
+                allow_no_auth: false,
+                allow_public_bind: false,
+                allow_wide_cors: false,
+                max_request_body_bytes: 30 * 1024 * 1024,
+                cors_allowed_origins: vec![],
+                enable_uploads: false,
+                upload_max_file_size_bytes: 5 * 1024 * 1024,
+                upload_allowed_content_types: vec![
+                    "text/plain".to_string(),
+                    "text/markdown".to_string(),
+                ],
+                allowed_containers: vec![
+                    "openclaw_forever".to_string(),
+                    "openclaw_vault".to_string(),
+                ],
+                reject_secrets: false,
+                documents_batch_concurrency: 4,
             },
             mcp: McpConfig::default(),
             database: DatabaseConfig {
@@ -114,6 +134,9 @@ mod tests {
             processing: ProcessingConfig {
                 chunk_size: 512,
                 chunk_overlap: 50,
+                allow_remote_urls: false,
+                remote_url_allowlist: vec![],
+                remote_url_max_bytes: 10 * 1024 * 1024,
             },
             memory: MemoryConfig {
                 episode_decay_days: 30.0,
@@ -154,7 +177,8 @@ mod tests {
         let db_backend = crate::db::LibSqlBackend::new(raw_db);
         let db: std::sync::Arc<dyn crate::db::DatabaseBackend> = std::sync::Arc::new(db_backend);
 
-        let embeddings = crate::embeddings::EmbeddingProvider::new(&config.embeddings).unwrap();
+        let embeddings =
+            crate::embeddings::EmbeddingProvider::new_mock(config.embeddings.dimensions);
         let ocr = crate::ocr::OcrProvider::new(&config.ocr).unwrap();
         let transcription =
             crate::transcription::TranscriptionProvider::new(&config.transcription).unwrap();

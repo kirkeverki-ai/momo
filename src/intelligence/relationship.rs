@@ -169,7 +169,7 @@ mod tests {
             batch_size: 8,
         };
 
-        EmbeddingProvider::new(&config).expect("failed to create test embeddings provider")
+        EmbeddingProvider::new_mock(config.dimensions)
     }
 
     fn test_llm_unavailable() -> LlmProvider {

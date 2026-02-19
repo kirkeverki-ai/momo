@@ -30,6 +30,13 @@ pub async fn mcp_auth_middleware(
     let container_tag = project_tag_from_headers(request.headers(), &project_header)
         .or_else(|| Some(state.config.mcp.default_container_tag.clone()));
 
+    if let Some(tag) = container_tag.as_ref() {
+        let allowed = &state.config.server.allowed_containers;
+        if !allowed.is_empty() && !allowed.iter().any(|candidate| candidate == tag) {
+            return unauthorized_json_rpc("Unauthorized: Container tag is not allowed");
+        }
+    }
+
     if !state.config.mcp.require_auth {
         request.extensions_mut().insert(McpAuthContext {
             user_id: "anonymous".to_string(),
@@ -41,6 +48,15 @@ pub async fn mcp_auth_middleware(
     }
 
     if state.config.server.api_keys.is_empty() {
+        if state.config.server.allow_no_auth {
+            request.extensions_mut().insert(McpAuthContext {
+                user_id: "anonymous".to_string(),
+                email: None,
+                name: None,
+                container_tag,
+            });
+            return next.run(request).await;
+        }
         return unauthorized_json_rpc(
             "Unauthorized: API keys not configured. Set MOMO_API_KEYS to enable MCP access.",
         );

@@ -1385,8 +1385,7 @@ mod tests {
             batch_size: 2,
         };
 
-        let provider =
-            EmbeddingProvider::new(&config).expect("failed to create embeddings provider");
+        let provider = EmbeddingProvider::new_mock(config.dimensions);
 
         (provider, mock_server)
     }

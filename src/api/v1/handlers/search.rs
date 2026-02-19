@@ -45,6 +45,38 @@ pub async fn search(
             "Query cannot be empty",
         );
     }
+    if req.q.len() > 2048 {
+        return ApiResponse::error(
+            crate::api::v1::response::ErrorCode::InvalidRequest,
+            "Query too long (max 2048 characters)",
+        );
+    }
+    if let Some(threshold) = req.threshold {
+        if !(0.0..=1.0).contains(&threshold) {
+            return ApiResponse::error(
+                crate::api::v1::response::ErrorCode::InvalidRequest,
+                "Threshold must be between 0.0 and 1.0",
+            );
+        }
+    }
+    if let Some(tags) = &req.container_tags {
+        let has_allowlist = !state.config.server.allowed_containers.is_empty();
+        for tag in tags {
+            if has_allowlist
+                && !state
+                    .config
+                    .server
+                    .allowed_containers
+                    .iter()
+                    .any(|allowed| allowed == tag)
+            {
+                return ApiResponse::error(
+                    crate::api::v1::response::ErrorCode::InvalidRequest,
+                    format!("Container tag '{tag}' is not allowed"),
+                );
+            }
+        }
+    }
 
     let start = Instant::now();
 
@@ -61,6 +93,7 @@ async fn search_documents(
     req: &SearchRequest,
     start: Instant,
 ) -> ApiResponse<SearchResponse> {
+    let limit = req.limit.map(|value| value.clamp(1, 100));
     let mut attempts = 0;
     let response = loop {
         let internal_req = SearchDocumentsRequest {
@@ -72,7 +105,7 @@ async fn search_documents(
             filters: None,
             include_full_docs: Some(req.include.documents),
             include_summary: Some(req.include.documents),
-            limit: req.limit,
+            limit,
             only_matching_chunks: Some(!req.include.chunks),
             rerank: req.rerank,
             rerank_level: None,
@@ -118,6 +151,7 @@ async fn search_memories(
         .as_ref()
         .and_then(|tags| tags.first().cloned());
 
+    let limit = req.limit.map(|value| value.clamp(1, 100));
     let mut attempts = 0;
     let response = loop {
         let internal_req = SearchMemoriesRequest {
@@ -126,7 +160,7 @@ async fn search_memories(
             threshold: req.threshold,
             filters: None,
             include: None,
-            limit: req.limit,
+            limit,
             rerank: req.rerank,
             rewrite_query: None,
         };
@@ -171,6 +205,7 @@ async fn search_hybrid(
         .as_ref()
         .and_then(|tags| tags.first().cloned());
 
+    let limit = req.limit.map(|value| value.clamp(1, 100));
     let mut attempts = 0;
     let response = loop {
         let internal_req = HybridSearchRequest {
@@ -179,7 +214,7 @@ async fn search_hybrid(
             threshold: req.threshold,
             filters: None,
             include: None,
-            limit: req.limit,
+            limit,
             rerank: req.rerank,
             rewrite_query: None,
             search_mode: SearchMode::Hybrid,

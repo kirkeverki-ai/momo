@@ -18,6 +18,25 @@ where
     }
 }
 
+fn parse_csv_value(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn parse_env_csv(var: &str) -> Vec<String> {
+    env::var(var)
+        .map(|value| parse_csv_value(&value))
+        .unwrap_or_default()
+}
+
+fn parse_env_csv_if_set(var: &str) -> Option<Vec<String>> {
+    env::var(var).ok().map(|value| parse_csv_value(&value))
+}
+
 /// Parse `RERANK_DOMAIN_MODELS` env var.
 /// Format: comma-separated `domain:model` pairs, e.g. `code:jina-reranker-v1-turbo-en,docs:bge-reranker-v2-m3`
 fn parse_domain_models() -> HashMap<String, String> {
@@ -62,6 +81,17 @@ pub struct ServerConfig {
     pub host: String,
     pub port: u16,
     pub api_keys: Vec<String>,
+    pub allow_no_auth: bool,
+    pub allow_public_bind: bool,
+    pub allow_wide_cors: bool,
+    pub max_request_body_bytes: usize,
+    pub cors_allowed_origins: Vec<String>,
+    pub enable_uploads: bool,
+    pub upload_max_file_size_bytes: usize,
+    pub upload_allowed_content_types: Vec<String>,
+    pub allowed_containers: Vec<String>,
+    pub reject_secrets: bool,
+    pub documents_batch_concurrency: usize,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -70,6 +100,7 @@ pub struct McpConfig {
     pub path: String,
     pub require_auth: bool,
     pub public_url: Option<String>,
+    pub trust_forwarded_headers: bool,
     pub default_container_tag: String,
     pub project_header: String,
     pub oauth_authorization_server: Option<String>,
@@ -173,6 +204,9 @@ impl Default for TranscriptionConfig {
 pub struct ProcessingConfig {
     pub chunk_size: usize,
     pub chunk_overlap: usize,
+    pub allow_remote_urls: bool,
+    pub remote_url_allowlist: Vec<String>,
+    pub remote_url_max_bytes: usize,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -200,13 +234,45 @@ pub struct InferenceConfig {
 
 impl Default for Config {
     fn default() -> Self {
+        let cors_allowed_origins = parse_env_csv_if_set("MOMO_CORS_ORIGINS")
+            .or_else(|| parse_env_csv_if_set("MOMO_CORS_ALLOWED_ORIGINS"))
+            .unwrap_or_else(|| vec!["http://127.0.0.1:18888".to_string()]);
+        let upload_allowed_content_types =
+            parse_env_csv_if_set("MOMO_UPLOAD_ALLOWED_CONTENT_TYPES")
+                .unwrap_or_else(|| vec!["text/plain".to_string(), "text/markdown".to_string()]);
+        let allowed_containers = parse_env_csv_if_set("MOMO_ALLOWED_CONTAINERS")
+            .unwrap_or_else(|| vec!["openclaw_forever".to_string(), "openclaw_vault".to_string()]);
+
         Self {
             server: ServerConfig {
-                host: env::var("MOMO_HOST").unwrap_or_else(|_| "0.0.0.0".to_string()),
+                host: env::var("MOMO_HOST").unwrap_or_else(|_| "127.0.0.1".to_string()),
                 port: parse_env_or("MOMO_PORT", 3000),
                 api_keys: env::var("MOMO_API_KEYS")
-                    .map(|keys| keys.split(',').map(|s| s.trim().to_string()).collect())
+                    .map(|keys| {
+                        keys.split(',')
+                            .map(str::trim)
+                            .filter(|item| !item.is_empty())
+                            .map(str::to_string)
+                            .collect()
+                    })
                     .unwrap_or_default(),
+                allow_no_auth: parse_env_or("MOMO_ALLOW_NO_AUTH", false),
+                allow_public_bind: parse_env_or("MOMO_ALLOW_PUBLIC_BIND", false),
+                allow_wide_cors: parse_env_or("MOMO_ALLOW_WIDE_CORS", false),
+                max_request_body_bytes: parse_env_or(
+                    "MOMO_MAX_REQUEST_BODY_BYTES",
+                    5 * 1024 * 1024,
+                ),
+                cors_allowed_origins,
+                enable_uploads: parse_env_or("MOMO_ENABLE_UPLOADS", false),
+                upload_max_file_size_bytes: parse_env_or(
+                    "MOMO_UPLOAD_MAX_FILE_SIZE_BYTES",
+                    5 * 1024 * 1024,
+                ),
+                upload_allowed_content_types,
+                allowed_containers,
+                reject_secrets: parse_env_or("MOMO_REJECT_SECRETS", false),
+                documents_batch_concurrency: parse_env_or("MOMO_DOCUMENTS_BATCH_CONCURRENCY", 4),
             },
             mcp: McpConfig::default(),
             database: DatabaseConfig {
@@ -223,6 +289,9 @@ impl Default for Config {
             processing: ProcessingConfig {
                 chunk_size: parse_env_or("CHUNK_SIZE", 512),
                 chunk_overlap: parse_env_or("CHUNK_OVERLAP", 50),
+                allow_remote_urls: parse_env_or("MOMO_ALLOW_REMOTE_URLS", false),
+                remote_url_allowlist: parse_env_csv("MOMO_REMOTE_URL_ALLOWLIST"),
+                remote_url_max_bytes: parse_env_or("MOMO_REMOTE_URL_MAX_BYTES", 10 * 1024 * 1024),
             },
             memory: MemoryConfig {
                 episode_decay_days: parse_env_or("EPISODE_DECAY_DAYS", 30.0),
@@ -302,7 +371,7 @@ impl Default for McpConfig {
         let path = env::var("MOMO_MCP_PATH").unwrap_or_else(|_| "/mcp".to_string());
 
         Self {
-            enabled: parse_env_or("MOMO_MCP_ENABLED", true),
+            enabled: parse_env_or("MOMO_MCP_ENABLED", false),
             path: if path.starts_with('/') {
                 path
             } else {
@@ -310,8 +379,9 @@ impl Default for McpConfig {
             },
             require_auth: parse_env_or("MOMO_MCP_REQUIRE_AUTH", true),
             public_url: env::var("MOMO_MCP_PUBLIC_URL").ok(),
+            trust_forwarded_headers: parse_env_or("MOMO_MCP_TRUST_FORWARDED_HEADERS", false),
             default_container_tag: env::var("MOMO_MCP_DEFAULT_CONTAINER_TAG")
-                .unwrap_or_else(|_| "default".to_string()),
+                .unwrap_or_else(|_| "openclaw_vault".to_string()),
             project_header: env::var("MOMO_MCP_PROJECT_HEADER")
                 .unwrap_or_else(|_| "x-sm-project".to_string()),
             oauth_authorization_server: env::var("MOMO_MCP_AUTHORIZATION_SERVER").ok(),
@@ -537,11 +607,34 @@ mod tests {
         std::env::remove_var("MOMO_MCP_PROJECT_HEADER");
 
         let config = Config::default();
-        assert!(config.mcp.enabled);
+        assert!(!config.mcp.enabled);
         assert_eq!(config.mcp.path, "/mcp");
         assert!(config.mcp.require_auth);
-        assert_eq!(config.mcp.default_container_tag, "default");
+        assert!(!config.mcp.trust_forwarded_headers);
+        assert_eq!(config.mcp.default_container_tag, "openclaw_vault");
         assert_eq!(config.mcp.project_header, "x-sm-project");
+    }
+
+    #[test]
+    fn test_server_safe_defaults() {
+        let _guard = RERANKER_TEST_MUTEX.lock().unwrap();
+        std::env::remove_var("MOMO_HOST");
+        std::env::remove_var("MOMO_CORS_ORIGINS");
+        std::env::remove_var("MOMO_CORS_ALLOWED_ORIGINS");
+        std::env::remove_var("MOMO_ENABLE_UPLOADS");
+        std::env::remove_var("MOMO_ALLOWED_CONTAINERS");
+
+        let config = Config::default();
+        assert_eq!(config.server.host, "127.0.0.1");
+        assert_eq!(
+            config.server.cors_allowed_origins,
+            vec!["http://127.0.0.1:18888".to_string()]
+        );
+        assert!(!config.server.enable_uploads);
+        assert_eq!(
+            config.server.allowed_containers,
+            vec!["openclaw_forever".to_string(), "openclaw_vault".to_string()]
+        );
     }
 
     #[test]

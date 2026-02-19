@@ -9,6 +9,8 @@ use axum_extra::extract::Query;
 use base64::Engine;
 use chrono::Utc;
 use nanoid::nanoid;
+use std::time::Duration;
+use tokio::time::timeout;
 
 use crate::api::v1::dto::{
     BatchCreateDocumentRequest, BatchCreateDocumentResponse, CreateDocumentRequest,
@@ -20,12 +22,63 @@ use crate::api::AppState;
 use crate::models::{Document, DocumentType, ProcessingStatus};
 use crate::processing::ContentExtractor;
 
+const MAX_BATCH_SIZE: usize = 600;
+const MAX_CONTENT_SIZE: usize = 5 * 1024 * 1024; // 5 MB per text payload
+const MAX_BATCH_CONTENT_SIZE: usize = 20 * 1024 * 1024; // 20 MB combined batch text
+const SECRET_SCAN_PREFIX_BYTES: usize = 4096;
+
 fn parse_form_bool(value: &str) -> Option<bool> {
     match value.trim().to_lowercase().as_str() {
         "true" | "1" | "yes" | "on" => Some(true),
         "false" | "0" | "no" | "off" => Some(false),
         _ => None,
     }
+}
+
+fn normalized_content_type(value: &str) -> String {
+    value
+        .split(';')
+        .next()
+        .unwrap_or(value)
+        .trim()
+        .to_ascii_lowercase()
+}
+
+fn is_container_allowed(state: &AppState, container: &str) -> bool {
+    if state.config.server.allowed_containers.is_empty() {
+        return true;
+    }
+    state
+        .config
+        .server
+        .allowed_containers
+        .iter()
+        .any(|allowed| allowed == container)
+}
+
+fn container_not_allowed<T>(container: &str) -> ApiResponse<T>
+where
+    T: serde::Serialize,
+{
+    ApiResponse::error(
+        ErrorCode::InvalidRequest,
+        format!("Container tag '{container}' is not allowed"),
+    )
+}
+
+fn contains_obvious_secret(text: &str) -> bool {
+    let prefix = &text[..text.len().min(SECRET_SCAN_PREFIX_BYTES)];
+    let lower = prefix.to_ascii_lowercase();
+
+    lower.contains("-----begin private key-----")
+        || lower.contains("aws_secret_access_key")
+        || lower.contains("openai_api_key")
+        || lower.contains("api_key=")
+        || lower.contains("x-api-key:")
+        || lower.contains("authorization: bearer ")
+        || lower.contains("sk-")
+        || lower.contains("ghp_")
+        || lower.contains("xoxb-")
 }
 
 /// `POST /api/v1/documents`
@@ -51,6 +104,23 @@ pub async fn create_document(
     if req.content.trim().is_empty() {
         return ApiResponse::error(ErrorCode::InvalidRequest, "Content cannot be empty");
     }
+    if req.content.len() > MAX_CONTENT_SIZE {
+        return ApiResponse::error(
+            ErrorCode::InvalidRequest,
+            format!(
+                "Content too large: {} bytes (max {} bytes)",
+                req.content.len(),
+                MAX_CONTENT_SIZE
+            ),
+        );
+    }
+
+    if state.config.server.reject_secrets && contains_obvious_secret(&req.content) {
+        return ApiResponse::error(
+            ErrorCode::InvalidRequest,
+            "Document rejected by secret redaction guard",
+        );
+    }
 
     // Validate container_tag length
     if let Some(ref tag) = req.container_tag {
@@ -59,6 +129,9 @@ pub async fn create_document(
                 ErrorCode::InvalidRequest,
                 "Container tag too long (max 255 characters)",
             );
+        }
+        if !is_container_allowed(&state, tag) {
+            return container_not_allowed(tag);
         }
     }
 
@@ -166,9 +239,6 @@ pub async fn create_document(
     })
 }
 
-const MAX_BATCH_SIZE: usize = 600;
-const MAX_FILE_SIZE: usize = 25 * 1024 * 1024; // 25 MB
-
 /// `POST /api/v1/documents:batch`
 ///
 /// Creates multiple documents in a single request and queues them for
@@ -189,6 +259,20 @@ pub async fn batch_create_documents(
     State(state): State<AppState>,
     axum::Json(req): axum::Json<BatchCreateDocumentRequest>,
 ) -> ApiResponse<BatchCreateDocumentResponse> {
+    let _permit = match timeout(Duration::from_secs(2), state.batch_ingest_limiter.acquire()).await
+    {
+        Ok(Ok(permit)) => permit,
+        Ok(Err(_)) => {
+            return ApiResponse::error(ErrorCode::InternalError, "Batch limiter is unavailable");
+        }
+        Err(_) => {
+            return ApiResponse::error(
+                ErrorCode::Conflict,
+                "Server is busy processing other batch requests; retry shortly",
+            );
+        }
+    };
+
     if req.documents.is_empty() {
         return ApiResponse::error(ErrorCode::InvalidRequest, "Documents array cannot be empty");
     }
@@ -207,15 +291,45 @@ pub async fn batch_create_documents(
                 "Container tag too long (max 255 characters)",
             );
         }
+        if !is_container_allowed(&state, tag) {
+            return container_not_allowed(tag);
+        }
     }
 
     let now = Utc::now();
     let mut results = Vec::with_capacity(req.documents.len());
     let mut doc_ids = Vec::with_capacity(req.documents.len());
+    let mut total_content_size = 0usize;
 
     for item in &req.documents {
         if item.content.trim().is_empty() {
             return ApiResponse::error(ErrorCode::InvalidRequest, "Content cannot be empty");
+        }
+        if item.content.len() > MAX_CONTENT_SIZE {
+            return ApiResponse::error(
+                ErrorCode::InvalidRequest,
+                format!(
+                    "Document content too large: {} bytes (max {} bytes)",
+                    item.content.len(),
+                    MAX_CONTENT_SIZE
+                ),
+            );
+        }
+        if state.config.server.reject_secrets && contains_obvious_secret(&item.content) {
+            return ApiResponse::error(
+                ErrorCode::InvalidRequest,
+                "Document rejected by secret redaction guard",
+            );
+        }
+        total_content_size = total_content_size.saturating_add(item.content.len());
+        if total_content_size > MAX_BATCH_CONTENT_SIZE {
+            return ApiResponse::error(
+                ErrorCode::InvalidRequest,
+                format!(
+                    "Batch content too large: {} bytes (max {} bytes)",
+                    total_content_size, MAX_BATCH_CONTENT_SIZE
+                ),
+            );
         }
 
         let id = nanoid!();
@@ -301,7 +415,13 @@ pub async fn upload_document(
     State(state): State<AppState>,
     mut multipart: Multipart,
 ) -> ApiResponse<CreateDocumentResponse> {
-    let mut file_bytes: Option<Vec<u8>> = None;
+    if !state.config.server.enable_uploads {
+        return ApiResponse::error(ErrorCode::NotFound, "Upload endpoint is disabled");
+    }
+
+    let max_file_size = state.config.server.upload_max_file_size_bytes.max(1024);
+
+    let mut file_bytes: Option<axum::body::Bytes> = None;
     let mut file_name: Option<String> = None;
     let mut file_content_type: Option<String> = None;
     let mut container_tag: Option<String> = None;
@@ -314,6 +434,9 @@ pub async fn upload_document(
         match name.as_str() {
             "file" => {
                 if let Some(name) = field.file_name() {
+                    if name.contains("..") || name.contains('/') || name.contains('\\') {
+                        return ApiResponse::error(ErrorCode::InvalidRequest, "Invalid file name");
+                    }
                     file_name = Some(name.to_string());
                 }
                 if let Some(content_type) = field.content_type() {
@@ -330,18 +453,18 @@ pub async fn upload_document(
                     }
                 };
 
-                if bytes.len() > MAX_FILE_SIZE {
+                if bytes.len() > max_file_size {
                     return ApiResponse::error(
                         ErrorCode::InvalidRequest,
                         format!(
                             "File too large: {} bytes (max {} bytes)",
                             bytes.len(),
-                            MAX_FILE_SIZE
+                            max_file_size
                         ),
                     );
                 }
 
-                file_bytes = Some(bytes.to_vec());
+                file_bytes = Some(bytes);
             }
             "containerTag" | "container_tag" => {
                 container_tag = match field.text().await {
@@ -364,7 +487,15 @@ pub async fn upload_document(
                         );
                     }
                 };
-                metadata = serde_json::from_str(&json_str).ok();
+                metadata = match serde_json::from_str(&json_str) {
+                    Ok(parsed) => Some(parsed),
+                    Err(e) => {
+                        return ApiResponse::error(
+                            ErrorCode::InvalidRequest,
+                            format!("Invalid metadata JSON: {e}"),
+                        );
+                    }
+                };
             }
             "extractMemories" | "extract_memories" => {
                 let raw = match field.text().await {
@@ -397,10 +528,29 @@ pub async fn upload_document(
         }
     };
 
+    let content_type = match file_content_type.as_deref() {
+        Some(value) => normalized_content_type(value),
+        None => {
+            return ApiResponse::error(ErrorCode::InvalidRequest, "Missing file content type");
+        }
+    };
+    if !state
+        .config
+        .server
+        .upload_allowed_content_types
+        .iter()
+        .any(|allowed| normalized_content_type(allowed) == content_type)
+    {
+        return ApiResponse::error(
+            ErrorCode::InvalidRequest,
+            format!("Unsupported upload content type: {content_type}"),
+        );
+    }
+
     let doc_type = ContentExtractor::detect_type_from_upload(
-        &bytes,
+        bytes.as_ref(),
         file_name.as_deref(),
-        file_content_type.as_deref(),
+        Some(&content_type),
     );
     if matches!(doc_type, DocumentType::Unknown) {
         return ApiResponse::error(ErrorCode::InvalidRequest, "Unsupported file type");
@@ -417,10 +567,27 @@ pub async fn upload_document(
                 "Container tag too long (max 255 characters)",
             );
         }
+        if !is_container_allowed(&state, tag) {
+            return container_not_allowed(tag);
+        }
         container_tags.push(tag.clone());
     }
 
-    let content_b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    if state.config.server.reject_secrets
+        && matches!(doc_type, DocumentType::Text | DocumentType::Markdown)
+    {
+        let scan_slice = &bytes[..bytes.len().min(SECRET_SCAN_PREFIX_BYTES)];
+        if let Ok(scan_text) = std::str::from_utf8(scan_slice) {
+            if contains_obvious_secret(scan_text) {
+                return ApiResponse::error(
+                    ErrorCode::InvalidRequest,
+                    "Document rejected by secret redaction guard",
+                );
+            }
+        }
+    }
+
+    let content_b64 = base64::engine::general_purpose::STANDARD.encode(bytes.as_ref());
 
     let mut doc_metadata = metadata.unwrap_or_default();
     doc_metadata.insert(
@@ -599,6 +766,14 @@ pub async fn list_documents(
     State(state): State<AppState>,
     Query(query): Query<ListDocumentsQuery>,
 ) -> ApiResponse<ListDocumentsResponse> {
+    if let Some(tags) = &query.container_tags {
+        for tag in tags {
+            if !is_container_allowed(&state, tag) {
+                return container_not_allowed(tag);
+            }
+        }
+    }
+
     let limit = query.limit.unwrap_or(20).clamp(1, 100);
 
     // Convert v1 query to internal ListDocumentsRequest (page-based internally)

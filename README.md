@@ -23,28 +23,43 @@ Momo is a self-hostable AI memory system written in Rust — inspired by SuperMe
 The fastest way to get Momo running is via Docker:
 
 ```bash
-docker run --name momo -d --restart unless-stopped -p 3000:3000 -v momo-data:/data ghcr.io/momomemory/momo:latest
+docker run --name momo -d --restart unless-stopped \
+  -p 127.0.0.1:3000:3000 \
+  -e MOMO_API_KEYS=change-me \
+  -v momo-data:/data \
+  ghcr.io/momomemory/momo:latest
 ```
 
 Then open:
 
 - Web console: `http://localhost:3000/`
 - API docs: `http://localhost:3000/api/v1/docs`
-- MCP endpoint: `http://localhost:3000/mcp`
+- MCP endpoint: disabled by default (`MOMO_MCP_ENABLED=false`)
 
-### Add a Memory
+### Index Documents
 ```bash
-curl -X POST http://localhost:3000/api/v1/conversations:ingest \
+curl -X POST http://localhost:3000/api/v1/documents:batch \
+  -H "Authorization: Bearer change-me" \
   -H "Content-Type: application/json" \
-  -d '{"messages": [{"role": "user", "content": "I prefer dark mode"}], "containerTag": "user_1"}'
+  -d '{"containerTag":"openclaw_vault","documents":[{"content":"I prefer dark mode"}]}'
 ```
 
 ### Search Everything
 ```bash
 curl -X POST http://localhost:3000/api/v1/search \
+  -H "Authorization: Bearer change-me" \
   -H "Content-Type: application/json" \
-  -d '{"q": "What are the user preferences?", "containerTags": ["user_1"], "scope": "hybrid"}'
+  -d '{"q":"dark mode","containerTags":["openclaw_vault"],"scope":"hybrid"}'
 ```
+
+### Security Defaults
+
+- Bind: `127.0.0.1` by default (`MOMO_HOST`)
+- Auth: fail-closed startup unless `MOMO_API_KEYS` is set, unless explicit `MOMO_ALLOW_NO_AUTH=1`
+- CORS: default allowlist is `http://127.0.0.1:18888` (`MOMO_CORS_ORIGINS`)
+- Upload endpoint: disabled by default (`MOMO_ENABLE_UPLOADS=false`)
+- Inference engine: disabled by default (`ENABLE_INFERENCES=false`)
+- MCP server: disabled by default (`MOMO_MCP_ENABLED=false`)
 
 ### Use As MCP Server
 
@@ -184,6 +199,9 @@ cargo clippy
 
 # Format code
 cargo fmt
+
+# Run hardened deployment checks (auth/cors/uploads/bind/smoke)
+./scripts/validate_hardening.sh
 ```
 
 Note: when frontend assets are missing, Rust build uses `momo/build.rs` to run `bun install` and `bun run build`.

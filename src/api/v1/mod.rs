@@ -24,6 +24,23 @@ mod tests {
                 host: "127.0.0.1".to_string(),
                 port: 3000,
                 api_keys,
+                allow_no_auth: false,
+                allow_public_bind: false,
+                allow_wide_cors: false,
+                max_request_body_bytes: 30 * 1024 * 1024,
+                cors_allowed_origins: vec![],
+                enable_uploads: false,
+                upload_max_file_size_bytes: 5 * 1024 * 1024,
+                upload_allowed_content_types: vec![
+                    "text/plain".to_string(),
+                    "text/markdown".to_string(),
+                ],
+                allowed_containers: vec![
+                    "openclaw_forever".to_string(),
+                    "openclaw_vault".to_string(),
+                ],
+                reject_secrets: false,
+                documents_batch_concurrency: 4,
             },
             mcp: McpConfig::default(),
             database: DatabaseConfig {
@@ -39,6 +56,9 @@ mod tests {
             processing: ProcessingConfig {
                 chunk_size: 512,
                 chunk_overlap: 50,
+                allow_remote_urls: false,
+                remote_url_allowlist: vec![],
+                remote_url_max_bytes: 10 * 1024 * 1024,
             },
             memory: MemoryConfig {
                 episode_decay_days: 30.0,
@@ -75,7 +95,8 @@ mod tests {
         let db_backend = crate::db::LibSqlBackend::new(raw_db);
         let db: std::sync::Arc<dyn crate::db::DatabaseBackend> = std::sync::Arc::new(db_backend);
 
-        let embeddings = crate::embeddings::EmbeddingProvider::new(&config.embeddings).unwrap();
+        let embeddings =
+            crate::embeddings::EmbeddingProvider::new_mock(config.embeddings.dimensions);
         let ocr = crate::ocr::OcrProvider::new(&config.ocr).unwrap();
         let transcription =
             crate::transcription::TranscriptionProvider::new(&config.transcription).unwrap();
@@ -122,7 +143,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn health_is_public() {
+    async fn health_requires_auth_without_key() {
         let app = create_router(test_state(vec!["secret".to_string()]).await);
 
         let response = app
@@ -135,17 +156,41 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
-    async fn openapi_json_is_public_and_valid() {
+    async fn health_is_accessible_with_auth() {
+        let app = create_router(test_state(vec!["secret".to_string()]).await);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/health")
+                    .header("authorization", "Bearer secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = body_json(response).await;
+        assert_eq!(json["data"]["ok"], true);
+        assert_eq!(json["data"]["authEnabled"], true);
+        assert_eq!(json["data"]["uploadsEnabled"], false);
+        assert_eq!(json["data"]["inferenceEnabled"], false);
+    }
+
+    #[tokio::test]
+    async fn openapi_json_is_valid_with_auth() {
         let app = create_router(test_state(vec!["secret".to_string()]).await);
 
         let response = app
             .oneshot(
                 Request::builder()
                     .uri("/api/v1/openapi.json")
+                    .header("authorization", "Bearer secret")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -171,6 +216,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri("/api/v1/health")
+                    .header("authorization", "Bearer k")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -220,5 +266,25 @@ mod tests {
             json["error"]["message"].is_string(),
             "error.message should be a string"
         );
+    }
+
+    #[tokio::test]
+    async fn upload_route_disabled_by_default() {
+        let app = create_router(test_state(vec!["key".to_string()]).await);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/documents:upload")
+                    .header("authorization", "Bearer key")
+                    .header("content-type", "multipart/form-data; boundary=---x")
+                    .body(Body::from("---x--"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 }

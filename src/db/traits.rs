@@ -48,6 +48,8 @@ pub trait DocumentStore: Send + Sync {
         status: ProcessingStatus,
         error: Option<&str>,
     ) -> Result<()>;
+    async fn claim_document_for_processing(&self, id: &str) -> Result<bool>;
+    async fn requeue_in_progress_documents(&self) -> Result<u64>;
     async fn queue_all_documents_for_reprocessing(&self) -> Result<u64>;
 }
 

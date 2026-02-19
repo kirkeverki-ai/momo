@@ -312,8 +312,23 @@ impl<T: Serialize> From<MomoError> for ApiResponse<T> {
                 ApiResponse::error(ErrorCode::NotImplemented, msg.clone())
             }
 
-            ref internal @ (MomoError::Database(_)
-            | MomoError::Processing(_)
+            MomoError::Database(ref msg) => {
+                let lower = msg.to_lowercase();
+                if lower.contains("database is locked")
+                    || lower.contains("database busy")
+                    || lower.contains("busy timeout")
+                {
+                    ApiResponse::error(
+                        ErrorCode::Conflict,
+                        "Database is busy; retry the request shortly",
+                    )
+                } else {
+                    tracing::error!(error = %msg, "Database error mapped to v1 response");
+                    ApiResponse::error(ErrorCode::InternalError, "A database error occurred")
+                }
+            }
+
+            ref internal @ (MomoError::Processing(_)
             | MomoError::Embedding(_)
             | MomoError::Http(_)
             | MomoError::Io(_)

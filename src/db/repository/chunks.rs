@@ -3,10 +3,10 @@ use libsql::{params, Connection};
 use crate::error::Result;
 use crate::models::{Chunk, ChunkWithDocument};
 
-/// Build parameterized LIKE clauses for container_tags filtering.
+/// Build parameterized tag clauses for container_tags filtering.
 /// Returns (sql_fragment, param_values) where sql_fragment uses positional
-/// placeholders starting at `start_idx` (e.g. "d.container_tags LIKE ?4 OR d.container_tags LIKE ?5")
-/// and param_values contains the corresponding LIKE patterns.
+/// placeholders starting at `start_idx` and param_values contains exact tag
+/// values for JSON matching via `json_each`.
 fn build_tag_filter(
     tags: &[String],
     start_idx: usize,
@@ -16,12 +16,11 @@ fn build_tag_filter(
     let mut values = Vec::with_capacity(tags.len());
     for (i, tag) in tags.iter().enumerate() {
         clauses.push(format!(
-            "{}.container_tags LIKE ?{}",
+            "EXISTS (SELECT 1 FROM json_each({}.container_tags) WHERE json_each.value = ?{})",
             column_prefix,
             start_idx + i
         ));
-        // LIKE pattern: match JSON array element containing this tag value
-        values.push(libsql::Value::from(format!("%\"{tag}%")));
+        values.push(libsql::Value::from(tag.clone()));
     }
     (clauses.join(" OR "), values)
 }
@@ -230,7 +229,10 @@ mod tests {
     fn test_build_tag_filter_single_tag() {
         let tags = vec!["mytag".to_string()];
         let (clause, vals) = build_tag_filter(&tags, 4, "d");
-        assert_eq!(clause, "d.container_tags LIKE ?4");
+        assert_eq!(
+            clause,
+            "EXISTS (SELECT 1 FROM json_each(d.container_tags) WHERE json_each.value = ?4)"
+        );
         assert_eq!(vals.len(), 1);
     }
 
@@ -240,7 +242,7 @@ mod tests {
         let (clause, vals) = build_tag_filter(&tags, 3, "d");
         assert_eq!(
             clause,
-            "d.container_tags LIKE ?3 OR d.container_tags LIKE ?4 OR d.container_tags LIKE ?5"
+            "EXISTS (SELECT 1 FROM json_each(d.container_tags) WHERE json_each.value = ?3) OR EXISTS (SELECT 1 FROM json_each(d.container_tags) WHERE json_each.value = ?4) OR EXISTS (SELECT 1 FROM json_each(d.container_tags) WHERE json_each.value = ?5)"
         );
         assert_eq!(vals.len(), 3);
     }
@@ -251,7 +253,10 @@ mod tests {
         let tags = vec![injection.clone()];
         let (clause, vals) = build_tag_filter(&tags, 1, "d");
 
-        assert_eq!(clause, "d.container_tags LIKE ?1");
+        assert_eq!(
+            clause,
+            "EXISTS (SELECT 1 FROM json_each(d.container_tags) WHERE json_each.value = ?1)"
+        );
         assert_eq!(vals.len(), 1);
         match &vals[0] {
             libsql::Value::Text(s) => {
@@ -272,11 +277,14 @@ mod tests {
     fn test_build_tag_filter_special_chars_preserved() {
         let tags = vec!["tag with \"quotes\" and % wildcards".to_string()];
         let (clause, vals) = build_tag_filter(&tags, 1, "x");
-        assert_eq!(clause, "x.container_tags LIKE ?1");
+        assert_eq!(
+            clause,
+            "EXISTS (SELECT 1 FROM json_each(x.container_tags) WHERE json_each.value = ?1)"
+        );
         match &vals[0] {
             libsql::Value::Text(s) => {
                 assert!(s.contains("\"quotes\""));
-                assert!(s.starts_with("%\""));
+                assert!(!s.starts_with("%\""));
             }
             other => panic!("Expected Text value, got {other:?}"),
         }

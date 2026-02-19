@@ -138,6 +138,55 @@ fn should_supervise_subprocesses(runtime_mode: RuntimeMode, single_process: bool
     matches!(runtime_mode, RuntimeMode::All) && !single_process
 }
 
+fn is_public_bind_host(host: &str) -> bool {
+    matches!(host.trim(), "0.0.0.0" | "::" | "[::]")
+}
+
+fn validate_startup_security(config: &Config) -> anyhow::Result<()> {
+    if config.server.api_keys.is_empty() && !config.server.allow_no_auth {
+        anyhow::bail!(
+            "Refusing to start without API keys. Set MOMO_API_KEYS, or set MOMO_ALLOW_NO_AUTH=1 for explicit dev mode."
+        );
+    }
+
+    if config.server.api_keys.is_empty() && config.server.allow_no_auth {
+        tracing::warn!(
+            "MOMO_ALLOW_NO_AUTH=1 with no API keys configured. Authentication is disabled (dev mode)."
+        );
+    }
+
+    if is_public_bind_host(&config.server.host) && !config.server.allow_public_bind {
+        anyhow::bail!(
+            "Refusing public bind '{}'. Use MOMO_HOST=127.0.0.1 (recommended), or set MOMO_ALLOW_PUBLIC_BIND=1 to explicitly allow public binding.",
+            config.server.host
+        );
+    }
+
+    if config
+        .server
+        .cors_allowed_origins
+        .iter()
+        .any(|origin| origin == "*")
+        && !config.server.allow_wide_cors
+    {
+        anyhow::bail!(
+            "Refusing wildcard CORS origin '*'. Set MOMO_ALLOW_WIDE_CORS=1 to explicitly allow it."
+        );
+    }
+
+    if config.server.documents_batch_concurrency == 0 {
+        anyhow::bail!("MOMO_DOCUMENTS_BATCH_CONCURRENCY must be greater than 0.");
+    }
+
+    if !config.server.api_keys.is_empty() && config.mcp.enabled && !config.mcp.require_auth {
+        anyhow::bail!(
+            "MCP is enabled without auth while API auth is enabled. Set MOMO_MCP_REQUIRE_AUTH=true or disable MCP."
+        );
+    }
+
+    Ok(())
+}
+
 fn read_replica_settings(
     write_config: &crate::config::DatabaseConfig,
 ) -> Option<ReadReplicaSettings> {
@@ -305,12 +354,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let config = Config::from_env();
-
-    if config.server.api_keys.is_empty() {
-        tracing::warn!(
-            "MOMO_API_KEYS is not set — admin endpoints are locked. Set MOMO_API_KEYS to enable /admin/* routes."
-        );
-    }
+    validate_startup_security(&config)?;
 
     tracing::info!("Initializing write database...");
     let write_raw_db = Database::new(&config.database).await?;
@@ -411,6 +455,14 @@ async fn main() -> anyhow::Result<()> {
 
     let cancel_token = CancellationToken::new();
     if runtime_mode.runs_worker() {
+        let requeued = state.db.requeue_in_progress_documents().await?;
+        if requeued > 0 {
+            tracing::info!(
+                count = requeued,
+                "Recovered in-progress documents from previous run by requeueing them"
+            );
+        }
+
         let processing_interval_secs = parse_env_u64("PROCESSING_POLL_INTERVAL_SECS", 10).max(1);
         tracing::info!(
             interval_secs = processing_interval_secs,
@@ -569,6 +621,7 @@ async fn main() -> anyhow::Result<()> {
             });
         }
 
+        let shutdown_db = state.db.clone();
         let app = create_router(state);
 
         let addr = format!("{}:{}", config.server.host, config.server.port);
@@ -584,6 +637,12 @@ async fn main() -> anyhow::Result<()> {
         axum::serve(listener, app)
             .with_graceful_shutdown(shutdown_signal(cancel_token))
             .await?;
+
+        if let Err(error) = shutdown_db.sync().await {
+            tracing::warn!(error = %error, "Database sync failed during shutdown");
+        } else {
+            tracing::info!("Database sync completed during shutdown");
+        }
 
         return Ok(());
     }
@@ -670,6 +729,77 @@ mod tests {
             Some("primary-local.db".to_string())
         );
         assert_eq!(settings.sync_interval_secs, 5);
+    }
+
+    #[test]
+    fn validate_startup_security_rejects_no_auth_by_default() {
+        let mut config = crate::config::Config::default();
+        config.server.api_keys = vec![];
+        config.server.allow_no_auth = false;
+        config.server.host = "127.0.0.1".to_string();
+        config.server.cors_allowed_origins = vec!["http://127.0.0.1:18888".to_string()];
+
+        let result = validate_startup_security(&config);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn validate_startup_security_allows_explicit_no_auth_dev_mode() {
+        let mut config = crate::config::Config::default();
+        config.server.api_keys = vec![];
+        config.server.allow_no_auth = true;
+        config.server.host = "127.0.0.1".to_string();
+        config.server.cors_allowed_origins = vec!["http://127.0.0.1:18888".to_string()];
+
+        let result = validate_startup_security(&config);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validate_startup_security_rejects_public_bind_without_override() {
+        let mut config = crate::config::Config::default();
+        config.server.api_keys = vec!["k".to_string()];
+        config.server.host = "0.0.0.0".to_string();
+        config.server.allow_public_bind = false;
+
+        let result = validate_startup_security(&config);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn validate_startup_security_rejects_wildcard_cors_without_override() {
+        let mut config = crate::config::Config::default();
+        config.server.api_keys = vec!["k".to_string()];
+        config.server.host = "127.0.0.1".to_string();
+        config.server.cors_allowed_origins = vec!["*".to_string()];
+        config.server.allow_wide_cors = false;
+
+        let result = validate_startup_security(&config);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn validate_startup_security_allows_wildcard_cors_with_override() {
+        let mut config = crate::config::Config::default();
+        config.server.api_keys = vec!["k".to_string()];
+        config.server.host = "127.0.0.1".to_string();
+        config.server.cors_allowed_origins = vec!["*".to_string()];
+        config.server.allow_wide_cors = true;
+
+        let result = validate_startup_security(&config);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validate_startup_security_rejects_unauthenticated_mcp_when_auth_enabled() {
+        let mut config = crate::config::Config::default();
+        config.server.api_keys = vec!["k".to_string()];
+        config.server.host = "127.0.0.1".to_string();
+        config.mcp.enabled = true;
+        config.mcp.require_auth = false;
+
+        let result = validate_startup_security(&config);
+        assert!(result.is_err());
     }
 
     fn parse_env_bool_from_raw(raw: &str, default: bool) -> bool {

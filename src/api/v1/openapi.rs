@@ -98,10 +98,6 @@ use super::response;
         dto::admin::ForgettingRunResponse,
         // Health (handler-local types)
         handlers::health::HealthData,
-        handlers::health::DatabaseStatus,
-        handlers::health::EmbeddingsStatus,
-        handlers::health::LlmStatus,
-        handlers::health::RerankerStatus,
     )),
     tags(
         (name = "health", description = "Health check"),

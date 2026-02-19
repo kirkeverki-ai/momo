@@ -170,6 +170,9 @@ mod tests {
         let config = ProcessingConfig {
             chunk_size: 1024,
             chunk_overlap: 100,
+            allow_remote_urls: false,
+            remote_url_allowlist: vec![],
+            remote_url_max_bytes: 10 * 1024 * 1024,
         };
         let registry = ChunkerRegistry::new(&config);
         let chunker = registry.get_chunker(&DocumentType::Text, None);

@@ -156,7 +156,11 @@ impl LlmApiClient {
                     let content = Self::extract_content(response)?;
                     tracing::debug!(response_len = content.len(), "LLM JSON response received");
                     return serde_json::from_str(&content).map_err(|e| {
-                        tracing::error!(response_len = content.len(), response_preview = %&content.chars().take(100).collect::<String>(), error = %e, "Failed to parse JSON response");
+                        tracing::error!(
+                            response_len = content.len(),
+                            error = %e,
+                            "Failed to parse JSON response"
+                        );
                         MomoError::Llm(format!("Failed to parse JSON response: {e}"))
                     });
                 }

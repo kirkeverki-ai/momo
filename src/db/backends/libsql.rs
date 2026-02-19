@@ -78,6 +78,14 @@ impl DocumentStore for LibSqlBackend {
         let conn = self.db.connect()?;
         DocumentRepository::update_status(&conn, id, status, error).await
     }
+    async fn claim_document_for_processing(&self, id: &str) -> Result<bool> {
+        let conn = self.db.connect()?;
+        DocumentRepository::claim_for_processing(&conn, id).await
+    }
+    async fn requeue_in_progress_documents(&self) -> Result<u64> {
+        let conn = self.db.connect()?;
+        DocumentRepository::requeue_in_progress(&conn).await
+    }
     async fn queue_all_documents_for_reprocessing(&self) -> Result<u64> {
         let conn = self.db.connect()?;
         let affected = conn

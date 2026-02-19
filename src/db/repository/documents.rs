@@ -190,8 +190,11 @@ impl DocumentRepository {
         if let Some(ref tags) = req.container_tags {
             if !tags.is_empty() {
                 for (i, tag) in tags.iter().enumerate() {
-                    where_clauses.push(format!("container_tags LIKE ?{}", i + 1));
-                    tag_params.push(libsql::Value::from(format!("%\"{tag}%")));
+                    where_clauses.push(format!(
+                        "EXISTS (SELECT 1 FROM json_each(container_tags) WHERE json_each.value = ?{})",
+                        i + 1
+                    ));
+                    tag_params.push(libsql::Value::from(tag.clone()));
                 }
             }
         }
@@ -244,7 +247,7 @@ impl DocumentRepository {
                 r#"
                 SELECT id, status, title, created_at 
                 FROM documents 
-                WHERE status NOT IN ('done', 'failed')
+                WHERE status = 'queued'
                 ORDER BY created_at ASC
                 "#,
                 (),
@@ -267,6 +270,38 @@ impl DocumentRepository {
         }
 
         Ok(docs)
+    }
+
+    pub async fn claim_for_processing(conn: &Connection, id: &str) -> Result<bool> {
+        let now = Utc::now().to_rfc3339();
+        let rows_affected = conn
+            .execute(
+                r#"
+                UPDATE documents
+                SET status = 'extracting', error_message = NULL, updated_at = ?2
+                WHERE id = ?1 AND status = 'queued'
+                "#,
+                params![id, now],
+            )
+            .await?;
+
+        Ok(rows_affected > 0)
+    }
+
+    pub async fn requeue_in_progress(conn: &Connection) -> Result<u64> {
+        let now = Utc::now().to_rfc3339();
+        let rows_affected = conn
+            .execute(
+                r#"
+                UPDATE documents
+                SET status = 'queued', updated_at = ?1
+                WHERE status IN ('extracting', 'chunking', 'embedding', 'indexing')
+                "#,
+                params![now],
+            )
+            .await?;
+
+        Ok(rows_affected)
     }
 
     pub async fn update_status(

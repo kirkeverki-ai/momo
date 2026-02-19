@@ -165,6 +165,23 @@ mod tests {
                 host: "0.0.0.0".to_string(),
                 port: 3000,
                 api_keys: vec![],
+                allow_no_auth: false,
+                allow_public_bind: false,
+                allow_wide_cors: false,
+                max_request_body_bytes: 30 * 1024 * 1024,
+                cors_allowed_origins: vec![],
+                enable_uploads: false,
+                upload_max_file_size_bytes: 5 * 1024 * 1024,
+                upload_allowed_content_types: vec![
+                    "text/plain".to_string(),
+                    "text/markdown".to_string(),
+                ],
+                allowed_containers: vec![
+                    "openclaw_forever".to_string(),
+                    "openclaw_vault".to_string(),
+                ],
+                reject_secrets: false,
+                documents_batch_concurrency: 4,
             },
             mcp: McpConfig::default(),
             database: DatabaseConfig {
@@ -180,6 +197,9 @@ mod tests {
             processing: ProcessingConfig {
                 chunk_size: 512,
                 chunk_overlap: 50,
+                allow_remote_urls: false,
+                remote_url_allowlist: vec![],
+                remote_url_max_bytes: 10 * 1024 * 1024,
             },
             memory: MemoryConfig {
                 episode_decay_days: 30.0,

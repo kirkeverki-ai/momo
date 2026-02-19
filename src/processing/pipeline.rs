@@ -52,7 +52,7 @@ impl ProcessingPipeline {
             ocr,
             transcription,
             llm,
-            extractor: ContentExtractor::new(),
+            extractor: ContentExtractor::from_processing_config(&config.processing),
             memory_extractor,
             llm_filter,
             registry: ChunkerRegistry::new(&config.processing),
@@ -63,13 +63,18 @@ impl ProcessingPipeline {
     }
 
     pub async fn process_document(&self, doc_id: &str) -> Result<()> {
+        let claimed = self.db.claim_document_for_processing(doc_id).await?;
+        if !claimed {
+            tracing::debug!(
+                doc_id = %doc_id,
+                "Skipping document processing because it is already being processed or not queued"
+            );
+            return Ok(());
+        }
+
         let doc = self.db.get_document_by_id(doc_id).await?.ok_or_else(|| {
             crate::error::MomoError::NotFound(format!("Document {doc_id} not found"))
         })?;
-
-        self.db
-            .update_document_status(doc_id, ProcessingStatus::Extracting, None)
-            .await?;
 
         let content = doc.content.as_deref().unwrap_or("");
 
@@ -555,7 +560,7 @@ impl Clone for ProcessingPipeline {
             ocr: self.ocr.clone(),
             transcription: self.transcription.clone(),
             llm: self.llm.clone(),
-            extractor: ContentExtractor::new(),
+            extractor: self.extractor.clone(),
             memory_extractor: self.memory_extractor.clone(),
             llm_filter: self.llm_filter.clone(),
             registry: ChunkerRegistry::default(),
@@ -633,10 +638,8 @@ mod tests {
             batch_size: 8,
         };
 
-        let embeddings = EmbeddingProvider::new(&embeddings_config)
-            .expect("failed to create embeddings provider");
-        let memory_embeddings = EmbeddingProvider::new(&embeddings_config)
-            .expect("failed to create memory embeddings provider");
+        let embeddings = EmbeddingProvider::new_mock(embeddings_config.dimensions);
+        let memory_embeddings = EmbeddingProvider::new_mock(embeddings_config.dimensions);
 
         let llm_config = LlmConfig {
             model: "openai/gpt-4o-mini".to_string(),
@@ -742,8 +745,7 @@ mod tests {
             batch_size: 8,
         };
 
-        let embeddings = EmbeddingProvider::new(&embeddings_config)
-            .expect("failed to create embeddings provider");
+        let embeddings = EmbeddingProvider::new_mock(embeddings_config.dimensions);
 
         let llm_config = LlmConfig {
             model: "openai/gpt-4o-mini".to_string(),
@@ -842,8 +844,7 @@ mod tests {
             batch_size: 8,
         };
 
-        let embeddings = EmbeddingProvider::new(&embeddings_config)
-            .expect("failed to create embeddings provider");
+        let embeddings = EmbeddingProvider::new_mock(embeddings_config.dimensions);
 
         let llm_config = LlmConfig {
             model: "openai/gpt-4o-mini".to_string(),
@@ -933,8 +934,7 @@ mod tests {
             batch_size: 8,
         };
 
-        let embeddings = EmbeddingProvider::new(&embeddings_config)
-            .expect("failed to create embeddings provider");
+        let embeddings = EmbeddingProvider::new_mock(embeddings_config.dimensions);
 
         let llm_config = LlmConfig {
             model: "openai/gpt-4o-mini".to_string(),
@@ -1024,8 +1024,7 @@ mod tests {
             batch_size: 8,
         };
 
-        let embeddings = EmbeddingProvider::new(&embeddings_config)
-            .expect("failed to create embeddings provider");
+        let embeddings = EmbeddingProvider::new_mock(embeddings_config.dimensions);
 
         let llm = LlmProvider::unavailable("test unavailable");
 
@@ -1118,8 +1117,7 @@ mod tests {
             batch_size: 8,
         };
 
-        let embeddings = EmbeddingProvider::new(&embeddings_config)
-            .expect("failed to create embeddings provider");
+        let embeddings = EmbeddingProvider::new_mock(embeddings_config.dimensions);
 
         let llm_config = LlmConfig {
             model: "openai/gpt-4o-mini".to_string(),
@@ -1237,8 +1235,7 @@ mod tests {
             dimensions: 384,
             batch_size: 8,
         };
-        let embeddings = EmbeddingProvider::new(&embeddings_config)
-            .expect("failed to create embedding provider");
+        let embeddings = EmbeddingProvider::new_mock(embeddings_config.dimensions);
 
         let ocr = OcrProvider::new(&config.ocr).expect("failed to create ocr provider");
         let transcription = TranscriptionProvider::unavailable("test unavailable");
@@ -1301,8 +1298,7 @@ mod tests {
             dimensions: 384,
             batch_size: 8,
         };
-        let embeddings = EmbeddingProvider::new(&embeddings_config)
-            .expect("failed to create embedding provider");
+        let embeddings = EmbeddingProvider::new_mock(embeddings_config.dimensions);
 
         let ocr = OcrProvider::new(&config.ocr).expect("failed to create ocr provider");
         let transcription = TranscriptionProvider::unavailable("test");
@@ -1356,8 +1352,7 @@ mod tests {
             batch_size: 8,
         };
 
-        let embeddings = EmbeddingProvider::new(&embeddings_config)
-            .expect("failed to create embeddings provider");
+        let embeddings = EmbeddingProvider::new_mock(embeddings_config.dimensions);
 
         let config = Config::default();
         let ocr = OcrProvider::new(&config.ocr).expect("failed to create ocr provider");

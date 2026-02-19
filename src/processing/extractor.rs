@@ -1,4 +1,6 @@
+use futures::StreamExt;
 use scraper::{Html, Selector};
+use std::net::IpAddr;
 use url::Url;
 
 use crate::error::{MomoError, Result};
@@ -140,23 +142,66 @@ pub fn detect_video_format(bytes: &[u8]) -> Option<VideoFormat> {
     None
 }
 
+#[derive(Debug, Clone)]
+pub struct RemoteFetchConfig {
+    pub allow_remote_urls: bool,
+    pub allowlist: Vec<String>,
+    pub max_bytes: usize,
+}
+
+impl Default for RemoteFetchConfig {
+    fn default() -> Self {
+        Self {
+            allow_remote_urls: false,
+            allowlist: Vec::new(),
+            max_bytes: 10 * 1024 * 1024,
+        }
+    }
+}
+
+#[derive(Clone)]
 pub struct ContentExtractor {
     http_client: reqwest::Client,
+    remote_fetch: RemoteFetchConfig,
 }
 
 impl ContentExtractor {
     pub fn new() -> Self {
+        Self::with_remote_fetch(RemoteFetchConfig::default())
+    }
+
+    pub fn from_processing_config(config: &crate::config::ProcessingConfig) -> Self {
+        Self::with_remote_fetch(RemoteFetchConfig {
+            allow_remote_urls: config.allow_remote_urls,
+            allowlist: config
+                .remote_url_allowlist
+                .iter()
+                .map(|host| host.to_lowercase())
+                .collect(),
+            max_bytes: config.remote_url_max_bytes.max(1024),
+        })
+    }
+
+    fn with_remote_fetch(remote_fetch: RemoteFetchConfig) -> Self {
         Self {
             http_client: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(30))
+                .redirect(reqwest::redirect::Policy::limited(3))
                 .user_agent("NovaMemory/1.0")
                 .build()
                 .unwrap_or_default(),
+            remote_fetch,
         }
     }
 
     pub async fn extract(&self, content: &str) -> Result<ExtractedContent> {
         if content.starts_with("http://") || content.starts_with("https://") {
+            if !self.remote_fetch.allow_remote_urls {
+                return Err(MomoError::Processing(
+                    "Remote URL ingestion is disabled. Set MOMO_ALLOW_REMOTE_URLS=true to enable it."
+                        .to_string(),
+                ));
+            }
             self.extract_from_url(content).await
         } else if Self::looks_like_html(content) {
             self.extract_from_html(content)
@@ -179,8 +224,18 @@ impl ContentExtractor {
 
     pub async fn extract_from_url(&self, url_str: &str) -> Result<ExtractedContent> {
         let url = Url::parse(url_str)?;
+        self.validate_remote_url(&url).await?;
         let source_path = Self::extract_source_path_from_url(&url);
-        let response = self.http_client.get(url.clone()).send().await?;
+        let response = self.http_client.get(url).send().await?;
+
+        if !response.status().is_success() {
+            return Err(MomoError::Processing(format!(
+                "Failed to fetch URL: HTTP {}",
+                response.status()
+            )));
+        }
+
+        self.validate_remote_url(response.url()).await?;
 
         let content_type = response
             .headers()
@@ -189,44 +244,40 @@ impl ContentExtractor {
             .unwrap_or("text/plain");
 
         let doc_type = Self::detect_type_from_content_type(content_type, url_str);
+        let bytes = self.read_response_bytes_limited(response).await?;
 
         match doc_type {
             DocumentType::Pdf => {
-                let bytes = response.bytes().await?;
                 let mut extracted = self.extract_from_pdf(&bytes, Some(url_str))?;
                 extracted.source_path = source_path;
                 Ok(extracted)
             }
             DocumentType::Docx => {
-                let bytes = response.bytes().await?;
                 let mut extracted = self.extract_from_docx(&bytes)?;
                 extracted.url = Some(url_str.to_string());
                 extracted.source_path = source_path;
                 Ok(extracted)
             }
             DocumentType::Xlsx => {
-                let bytes = response.bytes().await?;
                 let mut extracted = self.extract_from_xlsx(&bytes)?;
                 extracted.url = Some(url_str.to_string());
                 extracted.source_path = source_path;
                 Ok(extracted)
             }
             DocumentType::Pptx => {
-                let bytes = response.bytes().await?;
                 let mut extracted = self.extract_from_pptx(&bytes)?;
                 extracted.url = Some(url_str.to_string());
                 extracted.source_path = source_path;
                 Ok(extracted)
             }
             DocumentType::Csv => {
-                let bytes = response.bytes().await?;
                 let mut extracted = self.extract_from_csv(&bytes)?;
                 extracted.url = Some(url_str.to_string());
                 extracted.source_path = source_path;
                 Ok(extracted)
             }
             _ => {
-                let text = response.text().await?;
+                let text = String::from_utf8_lossy(&bytes).to_string();
 
                 // Check if URL points to a code file before treating as webpage
                 if let Some(ref path) = source_path {
@@ -248,6 +299,106 @@ impl ContentExtractor {
                 extracted.doc_type = DocumentType::Webpage;
                 extracted.source_path = source_path;
                 Ok(extracted)
+            }
+        }
+    }
+
+    async fn validate_remote_url(&self, url: &Url) -> Result<()> {
+        let scheme = url.scheme();
+        if scheme != "http" && scheme != "https" {
+            return Err(MomoError::Processing(format!(
+                "Unsupported URL scheme '{scheme}'. Only http/https are allowed."
+            )));
+        }
+
+        let host = url
+            .host_str()
+            .ok_or_else(|| MomoError::Processing("URL host is missing".to_string()))?
+            .to_lowercase();
+
+        if !self.remote_fetch.allowlist.is_empty()
+            && !Self::host_matches_allowlist(&host, &self.remote_fetch.allowlist)
+        {
+            return Err(MomoError::Processing(format!(
+                "URL host '{host}' is not in MOMO_REMOTE_URL_ALLOWLIST"
+            )));
+        }
+
+        let port = url.port_or_known_default().unwrap_or(80);
+        let mut resolved = tokio::net::lookup_host((host.as_str(), port))
+            .await
+            .map_err(|error| {
+                MomoError::Processing(format!("Failed to resolve URL host '{host}': {error}"))
+            })?;
+
+        let mut saw_address = false;
+        for address in resolved.by_ref() {
+            saw_address = true;
+            if Self::is_private_or_reserved_ip(address.ip()) {
+                return Err(MomoError::Processing(format!(
+                    "URL resolves to a blocked private or reserved address: {}",
+                    address.ip()
+                )));
+            }
+        }
+
+        if !saw_address {
+            return Err(MomoError::Processing(format!(
+                "No address resolved for URL host '{host}'"
+            )));
+        }
+
+        Ok(())
+    }
+
+    async fn read_response_bytes_limited(&self, response: reqwest::Response) -> Result<Vec<u8>> {
+        let mut buffer = Vec::new();
+        let mut stream = response.bytes_stream();
+
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            let next_size = buffer.len().saturating_add(chunk.len());
+            if next_size > self.remote_fetch.max_bytes {
+                return Err(MomoError::Processing(format!(
+                    "Remote response exceeded limit ({} bytes). Adjust MOMO_REMOTE_URL_MAX_BYTES if needed.",
+                    self.remote_fetch.max_bytes
+                )));
+            }
+            buffer.extend_from_slice(&chunk);
+        }
+
+        Ok(buffer)
+    }
+
+    fn host_matches_allowlist(host: &str, allowlist: &[String]) -> bool {
+        allowlist.iter().any(|allowed| {
+            host == allowed
+                || host
+                    .strip_suffix(allowed)
+                    .is_some_and(|prefix| prefix.ends_with('.'))
+        })
+    }
+
+    fn is_private_or_reserved_ip(ip: IpAddr) -> bool {
+        match ip {
+            IpAddr::V4(v4) => {
+                let octets = v4.octets();
+                let is_carrier_grade_nat = octets[0] == 100 && (64..=127).contains(&octets[1]);
+                v4.is_private()
+                    || v4.is_loopback()
+                    || v4.is_link_local()
+                    || v4.is_broadcast()
+                    || v4.is_documentation()
+                    || v4.is_multicast()
+                    || v4.is_unspecified()
+                    || is_carrier_grade_nat
+            }
+            IpAddr::V6(v6) => {
+                v6.is_loopback()
+                    || v6.is_unique_local()
+                    || v6.is_unicast_link_local()
+                    || v6.is_multicast()
+                    || v6.is_unspecified()
             }
         }
     }
@@ -985,5 +1136,30 @@ fn main() {
 
         let url = Url::parse("https://example.com/no-extension").unwrap();
         assert_eq!(ContentExtractor::extract_source_path_from_url(&url), None);
+    }
+
+    #[test]
+    fn test_host_allowlist_matching() {
+        let allowlist = vec!["example.com".to_string(), "github.com".to_string()];
+        assert!(ContentExtractor::host_matches_allowlist(
+            "example.com",
+            &allowlist
+        ));
+        assert!(ContentExtractor::host_matches_allowlist(
+            "api.example.com",
+            &allowlist
+        ));
+        assert!(!ContentExtractor::host_matches_allowlist(
+            "evil-example.com",
+            &allowlist
+        ));
+    }
+
+    #[test]
+    fn test_private_ip_detection() {
+        let private_v4: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+        let public_v4: std::net::IpAddr = "8.8.8.8".parse().unwrap();
+        assert!(ContentExtractor::is_private_or_reserved_ip(private_v4));
+        assert!(!ContentExtractor::is_private_or_reserved_ip(public_v4));
     }
 }

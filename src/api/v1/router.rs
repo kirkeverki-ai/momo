@@ -43,20 +43,14 @@ pub fn v1_router(state: AppState) -> Router<AppState> {
     let containers = Router::new()
         .route("/tags", get(handlers::graph::list_container_tags))
         .route("/{tag}/graph", get(handlers::graph::get_container_graph));
-    let public_routes = Router::new()
+    let mut protected_routes = Router::new()
         .route("/health", get(handlers::health_check))
         .route("/openapi.json", get(super::openapi::openapi_json))
-        .merge(super::openapi::redoc_router());
-
-    let protected_routes = Router::new()
+        .merge(super::openapi::redoc_router())
         .nest("/documents", documents)
         .route(
             "/documents:batch",
             post(handlers::documents::batch_create_documents),
-        )
-        .route(
-            "/documents:upload",
-            post(handlers::documents::upload_document),
         )
         .route("/memories:forget", post(handlers::memories::forget_memory))
         .route("/profile:compute", post(handlers::profile::compute_profile))
@@ -71,8 +65,14 @@ pub fn v1_router(state: AppState) -> Router<AppState> {
         .nest("/ingestions", ingestions)
         .nest("/memories", memories)
         .nest("/search", search)
-        .nest("/containers", containers)
-        .route_layer(middleware::from_fn_with_state(state, v1_auth_middleware));
+        .nest("/containers", containers);
 
-    Router::new().merge(public_routes).merge(protected_routes)
+    if state.config.server.enable_uploads {
+        protected_routes = protected_routes.route(
+            "/documents:upload",
+            post(handlers::documents::upload_document),
+        );
+    }
+
+    protected_routes.route_layer(middleware::from_fn_with_state(state, v1_auth_middleware))
 }

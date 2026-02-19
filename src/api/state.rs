@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use tokio::sync::Semaphore;
 
 use crate::config::Config;
 use crate::db::DatabaseBackend;
@@ -24,6 +25,7 @@ pub struct AppState {
     pub memory: MemoryService,
     pub pipeline: ProcessingPipeline,
     pub extractor: MemoryExtractor,
+    pub batch_ingest_limiter: Arc<Semaphore>,
 }
 
 impl AppState {
@@ -57,6 +59,9 @@ impl AppState {
             llm.clone(),
             &config,
         );
+        let batch_ingest_limiter = Arc::new(Semaphore::new(
+            config.server.documents_batch_concurrency.max(1),
+        ));
 
         Self {
             config,
@@ -69,6 +74,7 @@ impl AppState {
             memory,
             pipeline,
             extractor,
+            batch_ingest_limiter,
         }
     }
 }
