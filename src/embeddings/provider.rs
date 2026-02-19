@@ -302,19 +302,40 @@ fn parse_bool(raw: &str) -> Option<bool> {
 
 #[cfg(test)]
 fn deterministic_embedding(text: &str, dimensions: usize, mode: EmbeddingMode) -> Vec<f32> {
-    let mode_seed = match mode {
-        EmbeddingMode::Query => 0_u64,
-        EmbeddingMode::Ingest => 1_u64,
-    };
+    let _ = mode;
+    let mut vector = vec![0.0f32; dimensions.max(1)];
+    let mut saw_token = false;
 
-    (0..dimensions)
-        .map(|index| {
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            text.hash(&mut hasher);
-            index.hash(&mut hasher);
-            mode_seed.hash(&mut hasher);
-            let bucket = (hasher.finish() % 2001) as i32;
-            (bucket as f32 / 1000.0) - 1.0
-        })
-        .collect()
+    for token in text
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .map(|t| t.to_ascii_lowercase())
+    {
+        saw_token = true;
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        token.hash(&mut hasher);
+        let hash = hasher.finish();
+
+        let idx_primary = (hash as usize) % vector.len();
+        let idx_secondary = ((hash >> 32) as usize) % vector.len();
+        let sign = if (hash & 1) == 0 { 1.0 } else { -1.0 };
+
+        vector[idx_primary] += sign;
+        if idx_secondary != idx_primary {
+            vector[idx_secondary] += sign * 0.5;
+        }
+    }
+
+    if !saw_token {
+        vector[0] = 1.0;
+    }
+
+    let norm = vector.iter().map(|v| v * v).sum::<f32>().sqrt();
+    if norm > 0.0 {
+        for v in &mut vector {
+            *v /= norm;
+        }
+    }
+
+    vector
 }

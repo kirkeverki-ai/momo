@@ -1705,16 +1705,50 @@ mod tests {
         insert_memory_real(&conn, "mem1", Some("space"), Utc::now(), &embeddings).await;
         insert_memory_real(&conn, "mem2", Some("space"), Utc::now(), &embeddings).await;
 
+        let baseline_service = SearchService::new(
+            db.clone(),
+            db.clone(),
+            embeddings.clone(),
+            None,
+            LlmProvider::unavailable("tests"),
+            &Config::from_env(),
+        );
+        let baseline = baseline_service
+            .search_hybrid(HybridSearchRequest {
+                q: "query".to_string(),
+                container_tag: Some("space".to_string()),
+                threshold: Some(0.0),
+                filters: None,
+                include: None,
+                limit: Some(10),
+                rerank: Some(false),
+                rewrite_query: Some(false),
+                search_mode: SearchMode::Memories,
+            })
+            .await
+            .unwrap();
+
+        let mem2_idx = baseline
+            .results
+            .iter()
+            .position(|r| r.id == "mem2")
+            .expect("mem2 should be present");
+        let mem1_idx = baseline
+            .results
+            .iter()
+            .position(|r| r.id == "mem1")
+            .expect("mem1 should be present");
+
         let reranker = RerankerProvider::new_mock(vec![
             RerankResult {
                 document: "Memory mem2".to_string(),
                 score: 0.95,
-                index: 1,
+                index: mem2_idx,
             },
             RerankResult {
                 document: "Memory mem1".to_string(),
                 score: 0.4,
-                index: 0,
+                index: mem1_idx,
             },
         ]);
 

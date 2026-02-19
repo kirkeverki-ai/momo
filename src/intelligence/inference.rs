@@ -855,20 +855,24 @@ mod tests {
         let embeddings = test_embeddings_provider().await;
 
         // Create seed and related memories with real embeddings
-        let seed = test_memory("mem_1", "User is a developer", Some("user_1"));
+        let seed = test_memory("mem_1", "User is a Rust developer", Some("user_1"));
         MemoryRepository::create(&conn, &seed).await.unwrap();
         let seed_embedding = embeddings
-            .embed_passage("User is a developer")
+            .embed_passage("User is a Rust developer")
             .await
             .unwrap();
         MemoryRepository::update_embedding(&conn, "mem_1", &seed_embedding)
             .await
             .unwrap();
 
-        let related = test_memory("mem_2", "User prefers dark mode", Some("user_1"));
+        let related = test_memory(
+            "mem_2",
+            "User is a Rust developer who prefers dark mode",
+            Some("user_1"),
+        );
         MemoryRepository::create(&conn, &related).await.unwrap();
         let related_embedding = embeddings
-            .embed_passage("User prefers dark mode")
+            .embed_passage("User is a Rust developer who prefers dark mode")
             .await
             .unwrap();
         MemoryRepository::update_embedding(&conn, "mem_2", &related_embedding)
@@ -921,20 +925,24 @@ mod tests {
         let (conn, db, _temp_dir) = test_database().await;
         let embeddings = test_embeddings_provider().await;
 
-        let seed = test_memory("mem_1", "User mentioned something", Some("user_1"));
+        let seed = test_memory("mem_1", "User mentioned project details", Some("user_1"));
         MemoryRepository::create(&conn, &seed).await.unwrap();
         let seed_embedding = embeddings
-            .embed_passage("User mentioned something")
+            .embed_passage("User mentioned project details")
             .await
             .unwrap();
         MemoryRepository::update_embedding(&conn, "mem_1", &seed_embedding)
             .await
             .unwrap();
 
-        let related = test_memory("mem_2", "Another thing mentioned", Some("user_1"));
+        let related = test_memory(
+            "mem_2",
+            "User mentioned project details and next steps",
+            Some("user_1"),
+        );
         MemoryRepository::create(&conn, &related).await.unwrap();
         let related_embedding = embeddings
-            .embed_passage("Another thing mentioned")
+            .embed_passage("User mentioned project details and next steps")
             .await
             .unwrap();
         MemoryRepository::update_embedding(&conn, "mem_2", &related_embedding)
